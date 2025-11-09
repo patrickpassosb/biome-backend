@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --use-deprecated=legacy-resolver -r requirements.txt
 
 # Copy application code
 COPY biome_coaching_agent/ ./biome_coaching_agent/
