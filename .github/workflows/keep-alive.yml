@@ -1,0 +1,17 @@
+name: Keep Services Alive
+
+on:
+  schedule:
+    # Runs every 4 minutes
+    - cron: '*/4 * * * *'
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  keep-warm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Backend Health
+        run: curl -f https://biome-backend-524095675885.us-central1.run.app/health || true
+      
+      - name: Ping Frontend
+        run: curl -f https://biome-frontend-524095675885.us-central1.run.app || true
