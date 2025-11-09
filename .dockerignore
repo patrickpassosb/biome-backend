@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Frontend files (not needed in backend container)
+src/
+public/
+node_modules/
+package.json
+package-lock.json
+tailwind.config.js
+tsconfig.json
+postcss.config.js
+
+# Development files
+.git/
+.gitignore
+*.md
+!README.md
+.env
+*.pdf
+
+# Test files
+test_videos/
+*.mp4
+*.mov
+*.avi
+*.webm
+
+# Uploads (created at runtime)
+uploads/
+
+# Documentation and templates
+docs/
+ADK/
+ai-task-templates-main/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Scripts not needed in container
+start_*.ps1
+
