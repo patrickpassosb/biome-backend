@@ -90,26 +90,24 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Enable CORS for React frontend
-# Production: Use environment variable CORS_ORIGINS
-# Development: Allow common local dev ports
-if settings.is_production:
-    cors_origins = [origin.strip() for origin in settings.cors_origins.split(",")]
-else:
-    # Development mode - allow common local ports
-    cors_origins = [
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://localhost:8000",
-        "http://localhost:8001",
-        "http://localhost:8080",
-        "http://localhost:8081",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:3001",
-        "http://127.0.0.1:8000",
-        "http://127.0.0.1:8001",
-        "http://127.0.0.1:8080",
-        "http://127.0.0.1:8081",
-    ]
+# Allow both local development and production frontend
+cors_origins = [
+    # Production frontend
+    "https://biome-frontend-524095675885.us-central1.run.app",
+    # Local development ports
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:8000",
+    "http://localhost:8001",
+    "http://localhost:8080",
+    "http://localhost:8081",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8001",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8081",
+]
 
 app.add_middleware(
     CORSMiddleware,
