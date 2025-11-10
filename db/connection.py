@@ -1,6 +1,7 @@
 """
 Database connection utilities for PostgreSQL using psycopg (v3).
 Provides a context manager with connection pooling for better performance.
+Optimized for Neon serverless PostgreSQL + Cloud Run.
 """
 import contextlib
 from typing import Iterator, Optional
@@ -39,11 +40,14 @@ def get_pool() -> ConnectionPool:
   """
   Get or create the database connection pool.
   
-  Pool configuration:
-  - min_size=2: Keep 2 warm connections ready
-  - max_size=10: Allow up to 10 concurrent connections
+  Pool configuration optimized for Neon serverless + Cloud Run:
+  - min_size=0: No minimum connections (serverless-friendly, scales to zero)
+  - max_size=5: Allow up to 5 concurrent connections (sufficient for Cloud Run)
   - timeout=30: Wait max 30s for available connection
-  - max_idle=300: Close idle connections after 5 minutes
+  - max_idle=120: Close idle connections after 2 minutes
+  - max_lifetime=1800: Recycle connections after 30 minutes (Neon-friendly)
+  - connect_timeout=10: Timeout connection attempts after 10 seconds
+  - statement_timeout=60s: Timeout long-running queries
   
   Returns:
     ConnectionPool: Shared connection pool instance
@@ -52,18 +56,22 @@ def get_pool() -> ConnectionPool:
   
   if _pool is None:
     conn_string = _get_connection_string()
-    logger.info("Initializing database connection pool (min=2, max=10)")
+    logger.info("Initializing database connection pool (min=0, max=5) for Neon serverless")
     
     try:
       _pool = ConnectionPool(
         conn_string,
-        min_size=2,
-        max_size=10,
+        min_size=0,  # No minimum for serverless (Neon can scale to zero)
+        max_size=5,  # Smaller pool for Cloud Run + Neon serverless
         timeout=30,
-        max_idle=300,
-        max_lifetime=3600,  # Recycle connections after 1 hour
+        max_idle=120,  # Close idle connections after 2 minutes
+        max_lifetime=1800,  # Recycle connections after 30 minutes (prevents stale connections)
+        kwargs={
+          "connect_timeout": 10,  # Timeout connection attempts after 10 seconds
+          "options": "-c statement_timeout=60000",  # 60 second query timeout
+        },
       )
-      logger.info("Connection pool initialized successfully")
+      logger.info("Connection pool initialized successfully for Neon serverless")
     except Exception as e:
       logger.error(f"Failed to initialize connection pool: {e}", exc_info=True)
       raise

@@ -59,7 +59,7 @@ class Settings:
   # CORS Configuration
   cors_origins: str = os.getenv(
     "CORS_ORIGINS", 
-    "http://localhost:3000,http://localhost:8001,http://localhost:8081"
+    "https://biome-frontend-524095675885.us-central1.run.app,http://localhost:3000,http://localhost:8001,http://localhost:8081"
   )
   
   def validate(self) -> None:
