@@ -340,41 +340,90 @@ async def analyze_video_endpoint(
             # Track session_id from tool results to avoid race condition
             tracked_session_id = None
             
-            try:
-                async with asyncio.timeout(180):  # 3 minute maximum timeout
-                    agent_response_text = ""
-                    async for event in runner.run_async(
-                        user_id=user_id or "demo_user",
-                        session_id=adk_session.id,
-                        new_message=user_message,
-                    ):
-                        # Extract session_id from upload_video tool result
-                        if hasattr(event, 'tool_name') and event.tool_name == "upload_video":
-                            if hasattr(event, 'tool_result') and event.tool_result:
-                                result = event.tool_result
-                                if isinstance(result, dict) and result.get("status") == "success":
-                                    tracked_session_id = result.get("session_id")
-                                    logger.info(f"Tracked session_id from upload_video tool: {tracked_session_id}")
-                        
-                        # Log agent activity
-                        if event.content and event.content.parts:
-                            for part in event.content.parts:
-                                if part.text:
-                                    if event.author == "model":
-                                        agent_response_text += part.text
-                                        logger.debug(f"Agent response: {part.text[:100]}...")
-                
-                logger.info(f"ADK agent completed workflow orchestration")
+            # Retry logic for transient Vertex AI errors
+            max_retries = 3
+            retry_delays = [2, 5, 10]  # Exponential backoff: 2s, 5s, 10s
+            last_error = None
             
-            except asyncio.TimeoutError:
-                logger.error(f"Analysis timeout after 180 seconds for exercise: {exercise_name}")
-                raise HTTPException(
-                    status_code=504,
-                    detail={
-                        "error": "Analysis timeout - video too long or complex. Try a shorter video (max 2 minutes)",
-                        "step": "processing"
-                    }
-                )
+            for attempt in range(max_retries):
+                try:
+                    async with asyncio.timeout(180):  # 3 minute maximum timeout
+                        agent_response_text = ""
+                        async for event in runner.run_async(
+                            user_id=user_id or "demo_user",
+                            session_id=adk_session.id,
+                            new_message=user_message,
+                        ):
+                            # Extract session_id from upload_video tool result
+                            if hasattr(event, 'tool_name') and event.tool_name == "upload_video":
+                                if hasattr(event, 'tool_result') and event.tool_result:
+                                    result = event.tool_result
+                                    if isinstance(result, dict) and result.get("status") == "success":
+                                        tracked_session_id = result.get("session_id")
+                                        logger.info(f"Tracked session_id from upload_video tool: {tracked_session_id}")
+                            
+                            # Log agent activity
+                            if event.content and event.content.parts:
+                                for part in event.content.parts:
+                                    if part.text:
+                                        if event.author == "model":
+                                            agent_response_text += part.text
+                                            logger.debug(f"Agent response: {part.text[:100]}...")
+                    
+                    logger.info(f"ADK agent completed workflow orchestration")
+                    break  # Success, exit retry loop
+                    
+                except asyncio.TimeoutError:
+                    logger.error(f"Analysis timeout after 180 seconds for exercise: {exercise_name}")
+                    raise HTTPException(
+                        status_code=504,
+                        detail={
+                            "error": "Analysis timeout - video too long or complex. Try a shorter video (max 2 minutes)",
+                            "step": "processing"
+                        }
+                    )
+                except Exception as agent_error:
+                    last_error = agent_error
+                    error_str = str(agent_error).upper()  # Case-insensitive check
+                    
+                    # Check if this is a Vertex AI rate limit error (429 RESOURCE_EXHAUSTED)
+                    # Check multiple patterns to catch different error formats
+                    is_rate_limit = (
+                        "429" in error_str or 
+                        "RESOURCE_EXHAUSTED" in error_str or 
+                        "RESOURCE EXHAUSTED" in error_str or
+                        "RATE_LIMIT" in error_str or
+                        "QUOTA_EXCEEDED" in error_str
+                    )
+                    
+                    if is_rate_limit and attempt < max_retries - 1:
+                        # Retry with exponential backoff
+                        delay = retry_delays[attempt]
+                        logger.warning(
+                            f"Vertex AI rate limit exceeded (attempt {attempt + 1}/{max_retries}) "
+                            f"for exercise: {exercise_name}. Retrying in {delay}s..."
+                        )
+                        await asyncio.sleep(delay)
+                        continue  # Retry
+                    elif is_rate_limit:
+                        # Final attempt failed, return rate limit error
+                        logger.warning(f"Vertex AI rate limit exceeded after {max_retries} attempts for exercise: {exercise_name}")
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "error": "AI service is temporarily unavailable due to high demand. Please try again in a few moments.",
+                                "error_code": "RATE_LIMIT_EXCEEDED",
+                                "step": "ai_processing",
+                                "retry_after": 60  # Suggest retry after 60 seconds
+                            }
+                        )
+                    else:
+                        # Non-retryable error, re-raise to be handled by outer exception handler
+                        raise
+            
+            # If we exhausted retries without success and didn't raise an exception, raise the last error
+            if last_error and tracked_session_id is None:
+                raise last_error
             
         finally:
             # Always cleanup temp file
@@ -456,6 +505,26 @@ async def analyze_video_endpoint(
     except HTTPException:
         raise
     except Exception as e:
+        # Check for Vertex AI rate limit errors in the outer exception handler as well
+        error_str = str(e).upper()  # Case-insensitive check
+        if (
+            "429" in error_str or 
+            "RESOURCE_EXHAUSTED" in error_str or 
+            "RESOURCE EXHAUSTED" in error_str or
+            "RATE_LIMIT" in error_str or
+            "QUOTA_EXCEEDED" in error_str
+        ):
+            logger.warning(f"Vertex AI rate limit exceeded (outer handler): {e}")
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "AI service is temporarily unavailable due to high demand. Please try again in a few moments.",
+                    "error_code": "RATE_LIMIT_EXCEEDED",
+                    "step": "ai_processing",
+                    "retry_after": 60
+                }
+            )
+        
         logger.critical(f"Unexpected error in analyze endpoint: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
