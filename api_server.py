@@ -90,13 +90,21 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Enable CORS for React frontend
-# Production: Use environment variable CORS_ORIGINS
-# Development: Allow common local dev ports
-if settings.is_production:
-    cors_origins = [origin.strip() for origin in settings.cors_origins.split(",")]
-else:
-    # Development mode - allow common local ports
-    cors_origins = [
+# Always include the frontend Cloud Run URL
+frontend_url = "https://biome-frontend-524095675885.us-central1.run.app"
+
+# Start with CORS origins from environment variable
+cors_origins = []
+if settings.cors_origins:
+    cors_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
+
+# Always add the frontend URL
+if frontend_url not in cors_origins:
+    cors_origins.append(frontend_url)
+
+# If in development mode, also add localhost origins
+if settings.debug:
+    localhost_origins = [
         "http://localhost:3000",
         "http://localhost:3001",
         "http://localhost:8000",
@@ -110,6 +118,11 @@ else:
         "http://127.0.0.1:8080",
         "http://127.0.0.1:8081",
     ]
+    for origin in localhost_origins:
+        if origin not in cors_origins:
+            cors_origins.append(origin)
+
+logger.info(f"CORS origins configured: {cors_origins}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -339,6 +352,8 @@ async def analyze_video_endpoint(
             # Run agent with timeout to prevent hung requests
             # Track session_id from tool results to avoid race condition
             tracked_session_id = None
+            agent_completed_successfully = False
+            save_results_called = False
             
             # Retry logic for transient Vertex AI errors
             max_retries = 3
@@ -362,6 +377,15 @@ async def analyze_video_endpoint(
                                         tracked_session_id = result.get("session_id")
                                         logger.info(f"Tracked session_id from upload_video tool: {tracked_session_id}")
                             
+                            # Track if save_analysis_results was called
+                            if hasattr(event, 'tool_name') and event.tool_name == "save_analysis_results":
+                                save_results_called = True
+                                logger.info(f"save_analysis_results tool was called by agent")
+                                if hasattr(event, 'tool_result') and event.tool_result:
+                                    result = event.tool_result
+                                    if isinstance(result, dict):
+                                        logger.info(f"save_analysis_results result: {result.get('status', 'unknown')}")
+                            
                             # Log agent activity
                             if event.content and event.content.parts:
                                 for part in event.content.parts:
@@ -370,7 +394,8 @@ async def analyze_video_endpoint(
                                             agent_response_text += part.text
                                             logger.debug(f"Agent response: {part.text[:100]}...")
                     
-                    logger.info(f"ADK agent completed workflow orchestration")
+                    agent_completed_successfully = True
+                    logger.info(f"ADK agent completed workflow orchestration. save_analysis_results called: {save_results_called}")
                     break  # Success, exit retry loop
                     
                 except asyncio.TimeoutError:
@@ -472,13 +497,53 @@ async def analyze_video_endpoint(
         )
         
         # Retrieve results from database (saved by agent's save_analysis_results tool)
-        with get_db_connection() as conn:
-            result_data = queries.get_analysis_result_by_session(conn, session_id)
+        # Add retry logic with small delay to handle potential timing issues
+        result_data = None
+        max_result_retries = 5
+        result_retry_delay = 0.5  # 500ms between retries
+        
+        for retry_attempt in range(max_result_retries):
+            with get_db_connection() as conn:
+                result_data = queries.get_analysis_result_by_session(conn, session_id)
+            
+            if result_data:
+                logger.info(f"Results found in database on attempt {retry_attempt + 1}")
+                break
+            
+            if retry_attempt < max_result_retries - 1:
+                logger.warning(
+                    f"Results not found for session {session_id}, retrying in {result_retry_delay}s "
+                    f"(attempt {retry_attempt + 1}/{max_result_retries})"
+                )
+                await asyncio.sleep(result_retry_delay)
         
         if not result_data:
+            logger.error(f"Results not found in database after {max_result_retries} attempts for session {session_id}")
+            logger.error(f"Agent completed: {agent_completed_successfully}, save_analysis_results called: {save_results_called}")
+            
+            # Check if session exists at all
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT id, status FROM analysis_sessions WHERE id = %s", (session_id,))
+                session_row = cur.fetchone()
+                if session_row:
+                    logger.error(f"Session exists but no results. Session status: {session_row[1]}")
+                else:
+                    logger.error(f"Session {session_id} does not exist in database")
+            
+            error_msg = "Analysis completed but results could not be retrieved."
+            if not save_results_called:
+                error_msg += " The agent may not have called save_analysis_results."
+            else:
+                error_msg += " The agent called save_analysis_results but results were not found."
+            
             raise HTTPException(
                 status_code=500,
-                detail={"error": "Agent completed workflow but results not found in database"}
+                detail={
+                    "error": error_msg,
+                    "session_id": session_id,
+                    "step": "result_retrieval"
+                }
             )
         
         # Extract data from database result
@@ -506,14 +571,49 @@ async def analyze_video_endpoint(
         raise
     except Exception as e:
         # Check for Vertex AI rate limit errors in the outer exception handler as well
+        # BUT: If agent completed successfully and results were saved, don't fail the request
         error_str = str(e).upper()  # Case-insensitive check
-        if (
+        is_rate_limit = (
             "429" in error_str or 
             "RESOURCE_EXHAUSTED" in error_str or 
             "RESOURCE EXHAUSTED" in error_str or
             "RATE_LIMIT" in error_str or
             "QUOTA_EXCEEDED" in error_str
-        ):
+        )
+        
+        # If this is a rate limit error but we have results, try to return them anyway
+        if is_rate_limit and tracked_session_id:
+            logger.warning(f"Rate limit error after agent completion, attempting to retrieve saved results for session {tracked_session_id}")
+            try:
+                with get_db_connection() as conn:
+                    result_data = queries.get_analysis_result_by_session(conn, tracked_session_id)
+                    if result_data:
+                        logger.info(f"Successfully retrieved results despite rate limit error")
+                        # Extract and return results
+                        result_info = result_data["result"]
+                        issues = result_data["issues"]
+                        metrics = result_data["metrics"]
+                        strengths = result_data["strengths"]
+                        recommendations = result_data["recommendations"]
+                        processing_time = time.time() - start_time
+                        
+                        return JSONResponse({
+                            "status": "success",
+                            "session_id": tracked_session_id,
+                            "result_id": result_info["id"],
+                            "overall_score": float(result_info["overall_score"]),
+                            "total_frames": result_info["total_frames"],
+                            "processing_time": round(processing_time, 2),
+                            "issues": issues,
+                            "metrics": metrics,
+                            "strengths": [s["strength_text"] for s in strengths],
+                            "recommendations": [{"recommendation_text": r["recommendation_text"], "priority": r["priority"]} for r in recommendations],
+                        })
+            except Exception as retrieve_err:
+                logger.error(f"Failed to retrieve results after rate limit: {retrieve_err}")
+        
+        # If we couldn't recover, return the rate limit error
+        if is_rate_limit:
             logger.warning(f"Vertex AI rate limit exceeded (outer handler): {e}")
             raise HTTPException(
                 status_code=503,
